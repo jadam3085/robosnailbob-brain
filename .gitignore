@@ -1,0 +1,8 @@
+# Downloaded model binaries - not tracked in git
+models/
+voices/*.onnx
+voices/*.onnx.json
+__pycache__/
+*.pyc
+.eggs/
+*.egg-info/
