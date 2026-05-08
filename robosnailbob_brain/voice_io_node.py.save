@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+voice_io_node — mic input (VAD+STT) and audio output (Piper TTS)
+
+Publishes:  /voice/input  (std_msgs/String) — transcribed speech
+Subscribes: /voice/output (std_msgs/String) — sentence chunks to speak
+"""
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+
+import subprocess, tempfile, os, wave, threading, queue
+import webrtcvad
+from faster_whisper import WhisperModel
+
+
+WHISPER_MODEL_PATH = '/home/jadam/robot_ws/src/robosnailbob_brain/models/whisper-tiny-en'
+PIPER_MODEL_PATH   = '/home/jadam/robot_ws/src/robosnailbob_brain/voices/en_US-ryan-high.onnx'
+
+SAMPLE_RATE       = 16000
+FRAME_DURATION_MS = 30
+SILENCE_MS        = 800
+FRAME_SIZE        = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
+
+
+class VoiceIONode(Node):
+
+    def __init__(self):
+        super().__init__('voice_io_node')
+
+        # Parameters
+        self.declare_parameter('vad_aggressiveness', 2)
+        self.declare_parameter('silence_ms', SILENCE_MS)
+        self.declare_parameter('beam_size', 1)
+        vad_level   = self.get_parameter('vad_aggressiveness').value
+        silence_ms  = self.get_parameter('silence_ms').value
+        beam_size   = self.get_parameter('beam_size').value
+
+        self.silence_limit = int(silence_ms / FRAME_DURATION_MS)
+        self.beam_size = beam_size
+
+        # Publishers / subscribers
+        self.pub = self.create_publisher(String, '/voice/input', 10)
+        self.sub = self.create_subscription(
+            String, '/voice/output', self._on_voice_output, 10)
+
+        # VAD + STT
+        self.vad = webrtcvad.Vad(vad_level)
+        self.get_logger().info('Loading Whisper model...')
+        self.stt = WhisperModel(WHISPER_MODEL_PATH, device='cpu', compute_type='int8')
+        self.get_logger().info('Whisper ready.')
+
+        # TTS queue — sentences arrive here, played in order
+        self.tts_queue = queue.Queue()
+        self.is_speaking = threading.Event()
+
+        # Threads
+        threading.Thread(target=self._record_loop, daemon=True).start()
+        threading.Thread(target=self._tts_loop, daemon=True).start()
+
+        self.get_logger().info('voice_io_node ready.')
+
+    # ── TTS output ────────────────────────────────────────────────────────────
+
+    def _on_voice_output(self, msg: String):
+        """Queue each sentence chunk as it arrives."""
+        text = msg.data.strip()
+        if text:
+            self.tts_queue.put(text)
+
+    def _tts_loop(self):
+        """Drain TTS queue — starts Piper pipeline, feeds sentences, closes when queue empty."""
+        while rclpy.ok():
+            # Wait for first chunk
+            try:
+                first = self.tts_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            self.is_speaking.set()
+            piper = subprocess.Popen(
+                ['python3', '-m', 'piper',
+                 '--model', PIPER_MODEL_PATH,
+                 '--length_scale', '0.9',
+                 '--output_raw'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            aplay = subprocess.Popen(
+                ['aplay', '-r', '22050', '-f', 'S16_LE', '-t', 'raw', '-'],
+                stdin=piper.stdout,
+                stderr=subprocess.DEVNULL
+            )
+
+            try:
+                piper.stdin.write((first + ' ').encode())
+                piper.stdin.flush()
+
+                # Keep feeding while chunks arrive quickly
+                while True:
+                    try:
+                        chunk = self.tts_queue.get(timeout=0.6)
+                        piper.stdin.write((chunk + ' ').encode())
+                        piper.stdin.flush()
+                    except queue.Empty:
+                        break  # no more chunks — close pipeline
+            finally:
+                try:
+                    piper.stdin.close()
+                except Exception:
+                    pass
+                piper.wait()
+                aplay.wait()
+                self.is_speaking.clear()
+
+    # ── Recording loop ────────────────────────────────────────────────────────
+
+    def _record_loop(self):
+        """Continuously listen; publish transcription when speech detected."""
+        self.get_logger().info('Listening for speech...')
+        while rclpy.ok():
+            if self.is_speaking.is_set():
+                # Don't record while speaking (avoid feedback)
+                threading.Event().wait(0.1)
+                continue
+
+            wav_path = self._record_vad()
+            if wav_path is None:
+                continue
+
+            text = self._transcribe(wav_path)
+            os.unlink(wav_path)
+
+            if text:
+                self.get_logger().info(f'Heard: {text}')
+                msg = String()
+                msg.data = text
+                self.pub.publish(msg)
+
+    def _record_vad(self):
+        """Record until sustained silence. Returns wav path or None."""
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        tmp.close()
+
+        proc = subprocess.Popen(
+            ['arecord', '-f', 'S16_LE', '-r', str(SAMPLE_RATE), '-c', '1', '-t', 'raw'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+
+        frames = []
+        silence_frames = 0
+        started = False
+
+        try:
+            while rclpy.ok():
+                if self.is_speaking.is_set():
+                    proc.terminate()
+                    proc.wait()
+                    os.unlink(tmp.name)
+                    return None
+
+                frame = proc.stdout.read(FRAME_SIZE)
+                if len(frame) < FRAME_SIZE:
+                    break
+                is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
+
+                if is_speech:
+                    started = True
+                    silence_frames = 0
+                    frames.append(frame)
+                elif started:
+                    silence_frames += 1
+                    frames.append(frame)
+                    if silence_frames >= self.silence_limit:
+                        break
+        finally:
+            proc.terminate()
+            proc.wait()
+
+        if not started or not frames:
+            os.unlink(tmp.name)
+            return None
+
+        with wave.open(tmp.name, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(b''.join(frames))
+
+        return tmp.name
+
+    def _transcribe(self, wav_path: str) -> str:
+        segments, _ = self.stt.transcribe(wav_path, beam_size=self.beam_size)
+        return ' '.join(s.text.strip() for s in segments).strip()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VoiceIONode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
