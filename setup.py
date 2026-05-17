@@ -27,6 +27,8 @@ setup(
         'console_scripts': [
             'voice_io_node = robosnailbob_brain.voice_io_node:main',
             'llm_brain_node = robosnailbob_brain.llm_brain_node:main',
+            'mega_bridge_node = robot_bringup.scripts.mega_bridge_node:main',
+
         ],
     },
 )
