@@ -32,7 +32,7 @@ def generate_launch_description():
                 # (run: ollama pull llama3.2:1b)
                 'model': 'llama3.2:3b',
                 'num_ctx': 1024,
-                'num_predict': 100,
+                'num_predict': 60,   # ~2 short sentences; hard cap on runaway replies
                 'temperature': 0.7,
                 'keep_alive': '60m',  # was 30m — keeps model warm longer
             }]
