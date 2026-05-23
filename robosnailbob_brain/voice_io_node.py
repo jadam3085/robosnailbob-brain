@@ -28,6 +28,15 @@ from openwakeword.model import Model as WakeWordModel
 socket.getaddrinfo = _orig_getaddrinfo
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Piper in-process API (eliminates per-sentence model reload overhead) ──────
+try:
+    from piper.voice import PiperVoice as _PiperVoice
+    _PIPER_NATIVE = True
+except ImportError:
+    _PiperVoice = None
+    _PIPER_NATIVE = False
+# ─────────────────────────────────────────────────────────────────────────────
+
 from rclpy.node import Node
 from std_msgs.msg import String
 
@@ -44,12 +53,14 @@ OWW_MODELS_DIR     = '/home/jadam/.local/lib/python3.12/site-packages/openwakewo
 SAMPLE_RATE               = 16000
 FRAME_DURATION_MS         = 30
 FRAME_SIZE                = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
-SILENCE_MS                = 800
+SILENCE_MS                = 1000   # was 800 — extra margin for natural speech pauses
 SILENCE_LIMIT             = int(SILENCE_MS / FRAME_DURATION_MS)
 WAKEWORD_CHUNK            = 1280
 MIN_SPEECH_FRAMES         = 3
-SESSION_TIMEOUT_SEC       = 6      # seconds of silence before session closes
-POST_SESSION_COOLDOWN_SEC = 2.0    # pause after close before wake word resumes
+SESSION_TIMEOUT_SEC       = 8      # was 6 — more time for back-and-forth
+POST_SESSION_COOLDOWN_SEC = 2.0
+WAKEWORD_FALLBACK         = 'hey_jarvis_v0.1'  # used if custom model not found
+AUDIO_CHECK_INTERVAL_SEC  = 30.0   # throttle PipeWire health checks
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────
@@ -60,8 +71,8 @@ class VoiceIONode(Node):
         super().__init__('voice_io_node')
 
         self.declare_parameter('vad_aggressiveness',  1)
-        self.declare_parameter('wakeword_model',      'hey_jarvis_v0.1')
-        self.declare_parameter('wakeword_threshold',  0.2)
+        self.declare_parameter('wakeword_model',      'hey_snailbob')
+        self.declare_parameter('wakeword_threshold',  0.5)
         self.declare_parameter('beam_size',           1)
 
         vad_level         = self.get_parameter('vad_aggressiveness').value
@@ -83,11 +94,32 @@ class VoiceIONode(Node):
             WHISPER_MODEL_PATH, device='cpu', compute_type='int8')
         self.get_logger().info('Whisper ready.')
 
-        # Wake word
+        # Wake word — prefer custom model, fall back to hey_jarvis
         ww_path = os.path.join(OWW_MODELS_DIR, f'{ww_model_name}.onnx')
+        if not os.path.exists(ww_path):
+            self.get_logger().warn(
+                f'Wake word model not found: {ww_path}\n'
+                f'  → Falling back to {WAKEWORD_FALLBACK}. '
+                f'Train a custom model and place it at {ww_path} to activate.')
+            ww_path = os.path.join(OWW_MODELS_DIR, f'{WAKEWORD_FALLBACK}.onnx')
         self.get_logger().info(f'Loading wake word: {ww_path}')
         self.wakeword = WakeWordModel(wakeword_model_paths=[ww_path])
         self.get_logger().info('Wake word ready.')
+
+        # Piper TTS — in-process preferred (eliminates per-sentence startup cost)
+        self._last_audio_check = 0.0
+        if _PIPER_NATIVE:
+            try:
+                self.tts_voice = _PiperVoice.load(PIPER_MODEL_PATH)
+                self.get_logger().info('Piper TTS loaded in-process (fast mode).')
+            except Exception as e:
+                self.tts_voice = None
+                self.get_logger().warn(
+                    f'Piper in-process load failed: {e} — falling back to subprocess.')
+        else:
+            self.tts_voice = None
+            self.get_logger().warn(
+                'piper.voice not importable — using subprocess fallback (slower).')
 
         # State
         self.tts_queue        = queue.Queue()
@@ -108,7 +140,10 @@ class VoiceIONode(Node):
     # ── PipeWire watchdog ─────────────────────────────────────────────────────
 
     def _ensure_audio(self):
-        """Restart PipeWire if it's not running. Call before TTS."""
+        """Restart PipeWire if it's not running. Throttled to once per 30 s."""
+        if time.time() - self._last_audio_check < AUDIO_CHECK_INTERVAL_SEC:
+            return
+        self._last_audio_check = time.time()
         result = subprocess.run(
             ['systemctl', '--user', 'is-active', 'pipewire'],
             capture_output=True, text=True
@@ -119,7 +154,7 @@ class VoiceIONode(Node):
                 ['systemctl', '--user', 'restart', 'pipewire', 'pipewire-pulse'],
                 stderr=subprocess.DEVNULL
             )
-            time.sleep(1.5)   # give it a moment to come up
+            time.sleep(1.5)
             self.get_logger().info('PipeWire restarted.')
 
     # ── Process tracking ──────────────────────────────────────────────────────
@@ -162,36 +197,52 @@ class VoiceIONode(Node):
             self.tts_queue.put(text)
 
     def _speak_sentence(self, text: str):
-        """One Piper process per sentence — cleanest audio output."""
-        text = text.strip()
+        """Speak one sentence — uses in-process PiperVoice if loaded, else subprocess."""
+        text = ' '.join(text.split())   # collapse newlines and extra whitespace
         if not text:
             return
 
         self._ensure_audio()
 
-        piper = self._track(subprocess.Popen(
-            ['python3', '-m', 'piper',
-             '--model', PIPER_MODEL_PATH,
-             '--length_scale', '0.9',
-             '--output_raw'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        ))
-        aplay = self._track(subprocess.Popen(
-            ['aplay', '-r', '22050', '-f', 'S16_LE', '-t', 'raw', '-'],
-            stdin=piper.stdout,
-            stderr=subprocess.DEVNULL
-        ))
-        piper.stdin.write(text.encode())
-        piper.stdin.close()
-        piper.stdout.close()
-        piper.wait()
-        aplay.wait()
-        self._untrack(piper, aplay)
+        if self.tts_voice is not None:
+            # In-process synthesis — no Python startup or model reload per sentence
+            audio = b''.join(
+                self.tts_voice.synthesize_stream_raw(
+                    text, length_scale=0.9, sentence_silence=0.0))
+            if not audio:
+                return
+            proc = self._track(subprocess.Popen(
+                ['aplay', '-r', '22050', '-f', 'S16_LE', '-t', 'raw', '-'],
+                stdin=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            ))
+            proc.communicate(audio)
+            self._untrack(proc)
+        else:
+            # Subprocess fallback
+            piper = self._track(subprocess.Popen(
+                ['python3', '-m', 'piper',
+                 '--model', PIPER_MODEL_PATH,
+                 '--length_scale', '0.9',
+                 '--output_raw'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            ))
+            aplay = self._track(subprocess.Popen(
+                ['aplay', '-r', '22050', '-f', 'S16_LE', '-t', 'raw', '-'],
+                stdin=piper.stdout,
+                stderr=subprocess.DEVNULL
+            ))
+            piper.stdin.write(text.encode())
+            piper.stdin.close()
+            piper.stdout.close()
+            piper.wait()
+            aplay.wait()
+            self._untrack(piper, aplay)
 
     def _tts_loop(self):
-        """Drain TTS queue — one Piper call per sentence."""
+        """Drain TTS queue — no inter-sentence sleep for natural conversational flow."""
         while rclpy.ok():
             try:
                 sentence = self.tts_queue.get(timeout=0.5)
@@ -201,7 +252,6 @@ class VoiceIONode(Node):
             self.is_speaking.set()
             self._speak_sentence(sentence)
 
-            time.sleep(0.15)
             if self.tts_queue.empty():
                 self._extend_session()
                 self._play_sound('response_done.wav')
@@ -247,7 +297,6 @@ class VoiceIONode(Node):
                 self.get_logger().info('Session ended.')
                 self.session_active = False
                 self._play_sound('listen_stop.wav')
-                # Cooldown + reset wake word buffer to prevent immediate re-trigger
                 time.sleep(POST_SESSION_COOLDOWN_SEC)
                 self._reset_wakeword_buffer()
 
@@ -258,14 +307,13 @@ class VoiceIONode(Node):
                 self.session_active   = True
                 self.session_deadline = time.time() + SESSION_TIMEOUT_SEC
                 self.get_logger().info('Session started.')
-                self._reset_wakeword_buffer()   # clear buffer after detection too
+                self._reset_wakeword_buffer()
                 self._play_sound('listen_start.wav')
 
     # ── Wake word helpers ─────────────────────────────────────────────────────
 
     def _reset_wakeword_buffer(self):
-        """Clear openWakeWord's rolling prediction buffer.
-        Without this, a high score persists and immediately re-triggers."""
+        """Clear openWakeWord's rolling prediction buffer to prevent immediate re-triggers."""
         try:
             for key in self.wakeword.prediction_buffer:
                 self.wakeword.prediction_buffer[key].clear()
