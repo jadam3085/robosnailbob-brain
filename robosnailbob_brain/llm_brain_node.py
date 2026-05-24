@@ -81,6 +81,26 @@ class LLMBrainNode(Node):
             f'llm_brain_node ready — model: {self.model}, '
             f'personality: {personality_name}')
 
+        # Pre-warm Ollama so the model is in RAM before first user input
+        threading.Thread(target=self._warm_model, daemon=True).start()
+
+    # ── Model warm-up ────────────────────────────────────────────────────────
+
+    def _warm_model(self):
+        """Send a silent 1-token request at startup so the model is in RAM before first use."""
+        self.get_logger().info(f'Warming up {self.model}...')
+        try:
+            requests.post(OLLAMA_URL, json={
+                'model': self.model,
+                'messages': [{'role': 'user', 'content': 'hi'}],
+                'stream': False,
+                'keep_alive': self.keep_alive,
+                'options': {'num_predict': 1},
+            }, timeout=180)
+            self.get_logger().info('Model warm — ready for voice input.')
+        except Exception as e:
+            self.get_logger().warn(f'Model warm-up failed: {e}')
+
     # ── Personality ───────────────────────────────────────────────────────────
 
     def _load_personality(self, name: str) -> dict:
