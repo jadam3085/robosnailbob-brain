@@ -200,8 +200,8 @@ class LLMBrainNode(Node):
 
             self.conversation_history.append(
                 {'role': 'user', 'content': user_text})
-            if len(self.conversation_history) > 12:
-                self.conversation_history = self.conversation_history[-12:]
+            if len(self.conversation_history) > 6:
+                self.conversation_history = self.conversation_history[-6:]
 
             payload = {
                 'model': self.model,
