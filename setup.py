@@ -16,6 +16,10 @@ setup(
             glob('launch/*.py')),
         ('share/' + package_name + '/config/personalities',
             glob('config/personalities/*.yaml')),
+        ('share/' + package_name + '/config/dds',
+            glob('config/dds/*.xml')),
+        ('share/' + package_name + '/scripts',
+            glob('scripts/*.sh')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,7 +32,8 @@ setup(
             'voice_io_node = robosnailbob_brain.voice_io_node:main',
             'llm_brain_node = robosnailbob_brain.llm_brain_node:main',
             'mega_bridge_node = robot_bringup.scripts.mega_bridge_node:main',
-
+            'camera_watchdog_node = robosnailbob_brain.camera_watchdog_node:main',
+            'network_monitor_node = robosnailbob_brain.network_monitor_node:main',
         ],
     },
 )
