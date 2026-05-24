@@ -34,6 +34,7 @@ setup(
             'mega_bridge_node = robot_bringup.scripts.mega_bridge_node:main',
             'camera_watchdog_node = robosnailbob_brain.camera_watchdog_node:main',
             'network_monitor_node = robosnailbob_brain.network_monitor_node:main',
+            'server_gui = robosnailbob_brain.server_gui:main',
         ],
     },
 )
