@@ -25,10 +25,10 @@ def generate_launch_description():
                 # 1b is ~3x faster than 3b on CPU with acceptable quality for banter
                 # run: ollama pull llama3.2:1b
                 'model': 'llama3.2:1b',
-                'num_ctx': 512,       # was 1024 — smaller = faster prefill
+                'num_ctx': 2048,      # KV cache is RAM-cheap (64GB box); buys conversation memory
                 'num_predict': 50,    # hard cap; 2 short sentences fits easily
                 'temperature': 0.8,
-                'keep_alive': '60m',
+                'keep_alive': '-1',   # never evict — reload from disk was the "slow to respond" pause
             }]
         ),
     ])

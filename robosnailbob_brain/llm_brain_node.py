@@ -36,7 +36,7 @@ class LLMBrainNode(Node):
         self.declare_parameter('num_ctx',     1024)
         self.declare_parameter('num_predict', 100)
         self.declare_parameter('temperature', 0.7)
-        self.declare_parameter('keep_alive',  '60m')
+        self.declare_parameter('keep_alive',  '-1')
         self.declare_parameter('personality', 'default')
 
         self.model       = self.get_parameter('model').value
@@ -83,6 +83,22 @@ class LLMBrainNode(Node):
 
         # Pre-warm Ollama so the model is in RAM before first user input
         threading.Thread(target=self._warm_model, daemon=True).start()
+        # Residency guard: keep_alive=-1 survives eviction but not an Ollama
+        # restart — re-warm if the model ever drops out of RAM.
+        self.create_timer(600.0, self._check_model_resident)
+
+    def _check_model_resident(self):
+        def _check():
+            try:
+                r = requests.get('http://localhost:11434/api/ps', timeout=5)
+                loaded = [m.get('name', '') for m in r.json().get('models', [])]
+                if not any(self.model in n for n in loaded):
+                    self.get_logger().info(
+                        f'{self.model} not resident ({loaded}) — re-warming')
+                    self._warm_model()
+            except Exception:
+                pass
+        threading.Thread(target=_check, daemon=True).start()
 
     # ── Model warm-up ────────────────────────────────────────────────────────
 
