@@ -36,7 +36,7 @@ class LLMBrainNode(Node):
         self.declare_parameter('num_ctx',     1024)
         self.declare_parameter('num_predict', 100)
         self.declare_parameter('temperature', 0.7)
-        self.declare_parameter('keep_alive',  '-1')
+        self.declare_parameter('keep_alive',  '-1m')
         self.declare_parameter('personality', 'default')
 
         self.model       = self.get_parameter('model').value
@@ -106,13 +106,16 @@ class LLMBrainNode(Node):
         """Send a silent 1-token request at startup so the model is in RAM before first use."""
         self.get_logger().info(f'Warming up {self.model}...')
         try:
-            requests.post(OLLAMA_URL, json={
+            r = requests.post(OLLAMA_URL, json={
                 'model': self.model,
                 'messages': [{'role': 'user', 'content': 'hi'}],
                 'stream': False,
                 'keep_alive': self.keep_alive,
                 'options': {'num_predict': 1},
             }, timeout=180)
+            r.raise_for_status()
+            if 'error' in r.json():
+                raise RuntimeError(r.json()['error'])
             self.get_logger().info('Model warm — ready for voice input.')
         except Exception as e:
             self.get_logger().warn(f'Model warm-up failed: {e}')

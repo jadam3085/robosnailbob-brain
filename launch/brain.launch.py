@@ -28,7 +28,8 @@ def generate_launch_description():
                 'num_ctx': 2048,      # KV cache is RAM-cheap (64GB box); buys conversation memory
                 'num_predict': 50,    # hard cap; 2 short sentences fits easily
                 'temperature': 0.8,
-                'keep_alive': '-1',   # never evict — reload from disk was the "slow to respond" pause
+                'keep_alive': '-1m',  # never evict — reload from disk was the "slow to respond" pause
+                                      # (must be '-1m' not '-1': Ollama parses it as a Go duration)
             }]
         ),
     ])
