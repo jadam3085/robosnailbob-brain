@@ -161,62 +161,23 @@ When Jonathan comments `VERIFIED` on any issue:
 3. If satisfied → merges immediately → sends ntfy `notify "✅ Merged to main" "CR-### verified by Jonathan"`
 4. If not satisfied → comments on issue with specific concerns → sends ntfy `notify "⚠️ Needs attention" "CR-### merge blocked — see issue"`
 
-### Labeling Issues Agent-Ready
-Add the `agent-ready` label to a CR to queue it for the battle station orchestrator.
-The CR body **must** contain a fenced `scope` block or the orchestrator will reject it:
+### Orchestration Lives in snail_farm (2026-06-12)
+All orchestrator concerns — agent-ready labeling rules, scope blocks, model
+assignment, autonomy rules, circuit breakers, the watchdog daemon — are owned
+by the `snail_farm` repo (`~/robot_ws/src/snail_farm` on the battle station).
+Orchestrator references at this repo's level are redundant; consult
+snail_farm's own docs for current behavior.
 
-````
-```scope
-domain: ui  # ui | ros2 | llm_logic | simulation | firmware | research
-files_allowed:
-  - hud/static/index.html
-files_forbidden:
-  - launch/
-  - firmware/
-interfaces_frozen:
-  - /cmd_vel
-```
-````
+**Every new CR opened in this repo must be linked into the snail_farm
+project** so the orchestrator pipeline picks it up — reference snail_farm
+in the CR body and add it to the snail_farm project board.
 
-### Model Assignment Table
-| Domain       | Model               | Notes                              |
-|--------------|---------------------|------------------------------------|
-| `ui`         | qwen2.5-coder:32b   | HUD, WebSocket, JS/CSS/HTML        |
-| `ros2`       | qwen2.5-coder:32b   | ROS2 nodes, launch files, YAML     |
-| `llm_logic`  | llama3.3:70b        | Brain/voice nodes, LLM pipeline    |
-| `simulation` | qwen2.5-coder:32b   | URDF, Gazebo, simulation           |
-| `firmware`   | qwen2.5-coder:32b   | Arduino/ESP32 firmware             |
-| `research`   | claude              | Novel features — always escalates  |
+NOTE: snail_farm is not yet pushed to GitHub. Until it is, CR linkage and
+any orchestrator code changes can only happen on the battle station.
 
-### Autonomy Rules
-**Claude Code MAY autonomously:**
-- `ollama pull` a new model (reversible, zero risk)
-- Update model assignments in `agent_config.yml` after benchmarking
-- Add entries to `ollama_models_available`
-- Update aider or pip packages
-- Merge dev→main when diff review passes and no hardware test needed
-- Merge Fix Loop fixes to main without waiting for Jonathan
-
-**Claude Code MUST notify Jonathan (ntfy) and wait when:**
-- Physical hardware behavior needs human eyes (motors, sensors, robot movement)
-- Research domain task requiring architectural design
-- Agent fails twice and needs human diagnosis
-- CR touches TF tree, motor control, or safety-critical paths
-- `max_models` circuit breaker hit (currently 6)
-- Any change to CI/CD workflows or branch protection
-
-### Circuit Breaker
-`max_models: 6` — if distinct Ollama models would exceed 6, escalate to Jonathan.
-
-### Running the Orchestrator (battle station)
-The orchestrator lives in the `snail_farm` repo (`~/robot_ws/src/snail_farm`), not here.
-```bash
-cd ~/robot_ws/src/snail_farm
-./orchestrator/orchestrator_watchdog.sh --daemon   # start in background
-./orchestrator/orchestrator_watchdog.sh --status   # check if running
-./orchestrator/orchestrator_watchdog.sh --stop     # stop
-python3 orchestrator/agent_orchestrator.py --dry-run --once  # test
-```
+**Autonomy rules retained at this level:**
+- Claude Code MAY merge dev→main when diff review passes and no hardware test is needed, and merge Fix Loop fixes to main without waiting for Jonathan
+- Claude Code MUST notify Jonathan (ntfy) and wait when: physical hardware behavior needs human eyes; a CR touches TF tree, motor control, or safety-critical paths; or CI/CD workflows / branch protection would change
 
 ---
 
